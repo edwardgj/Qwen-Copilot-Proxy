@@ -24,7 +24,13 @@ GitHub Copilot Chat ↔️ localhost:1434 (Ollama endpoint)
 
 ### Installation
 
-1. **Install Python dependencies:**
+1. **Create and activate a virtual environment (recommended):**
+   ```bash
+   python -m venv qwen-proxy-venv
+   source qwen-proxy-venv/bin/activate  # On Windows: qwen-proxy-venv\Scripts\activate
+   ```
+
+2. **Install Python dependencies:**
    ```bash
    pip install -r requirements.txt
    ```
