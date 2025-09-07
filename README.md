@@ -63,7 +63,7 @@ GitHub Copilot Chat ↔️ localhost:1434 (Ollama endpoint)
    - Verify your OAuth credentials file exists
    - Check that the file is at `~/.qwen/oauth_creds.json`(different path on windows, if you're running this on Windows, you may need to edit the script for it to use the correct Path)
 
-2. **"Connection refused" in Copilot Chat**
+2. **Ollama provider not doing anything after being selected in Copilot Chat**
    - Make sure the proxy server is running
    - Check that no other service is using port 11434
 
