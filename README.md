@@ -18,7 +18,7 @@ GitHub Copilot Chat ↔️ localhost:1434 (Ollama endpoint)
 
 ### Prerequisites
 
-1. **Qwen Account**: You need to install the Qwen-code CLI and create and account with the OAuth option to get access to Qwen-Code models
+1. **Qwen Account**: You need to install the Qwen-code CLI and create an account with the OAuth option to get access to Qwen-Code models
 2. **Qwen OAuth Credentials**: Stored in `~/.qwen/oauth_creds.json`
 3. **Python 3.8+**: Required to run the proxy server
 
