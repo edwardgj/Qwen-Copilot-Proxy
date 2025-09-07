@@ -7,7 +7,7 @@ A simple proxy server that enables Qwen Code models to work with GitHub Copilot 
 This proxy server acts as a bridge between GitHub Copilot Chat and Qwen's Code models API. It fools Copilot Chat into thinking it's communicating with Ollama while actually forwarding requests to Qwen's API.
 
 ```
-GitHub Copilot Chat ↔️ localhost:1434 (Ollama endpoint) 
+GitHub Copilot Chat ↔️ localhost:11434 (Ollama endpoint) 
                               ↓
                     Qwen-Copilot-Proxy Server
                               ↓
