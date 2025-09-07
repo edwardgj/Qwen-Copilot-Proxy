@@ -61,7 +61,7 @@ GitHub Copilot Chat ↔️ localhost:1434 (Ollama endpoint)
 
 1. **"Failed to authenticate with Qwen"**
    - Verify your OAuth credentials file exists
-   - Check that the file is at `~/.qwen/oauth_creds.json`(different path in windows, if you're running this on Windows, you'll also need to edit the script for it to use the correct Path)
+   - Check that the file is at `~/.qwen/oauth_creds.json`(different path in windows, if you're running this on Windows, you may need to edit the script for it to use the correct Path)
 
 2. **"Connection refused" in Copilot Chat**
    - Make sure the proxy server is running
