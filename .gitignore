@@ -9,9 +9,6 @@ __pycache__/
 # Virtual environment
 qwen-proxy-venv/
 
-# Qwen credentials
-.qwen/
-
 # IDE files
 .vscode/
 .idea/
