@@ -1,8 +1,15 @@
 import asyncio
 import json
 import os
+import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
+
+if not hasattr(sys.stdout, 'isatty'):
+    sys.stdout.isatty = lambda: False
+if not hasattr(sys.stderr, 'isatty'):
+    sys.stderr.isatty = lambda: False
 
 import httpx
 from fastapi import FastAPI, Request, Response
@@ -185,6 +192,75 @@ async def list_running_models():
     # Return empty list as we don't actually run models locally
     return {"models": []}
 
+# --- OpenAI-compatible /v1/models endpoints ---
+@app.get("/v1/models")
+async def openai_list_models():
+    """List available models dynamically from Qwen API."""
+    await ensure_authenticated()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            qwen_url = f"{get_base_url()}/models"
+            headers = {
+                "Authorization": f"Bearer {credentials['access_token']}"
+            }
+            response = await client.get(qwen_url, headers=headers)
+            if response.status_code == 200:
+                return response.json()
+    except Exception as e:
+        print(f"Failed to fetch models from Qwen: {e}")
+
+    # Fallback to hardcoded list if upstream fails
+    current_time = int(time.time())
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": "qwen3-coder-plus",
+                "object": "model",
+                "created": current_time,
+                "owned_by": "qwen",
+                "permission": [],
+                "root": "qwen3-coder-plus",
+                "parent": None,
+            },
+            {
+                "id": "vision-model",
+                "object": "model",
+                "created": current_time,
+                "owned_by": "qwen",
+                "permission": [],
+                "root": "vision-model",
+                "parent": None,
+            },
+        ],
+    }
+
+@app.get("/v1/models/{model_id}")
+async def openai_retrieve_model(model_id: str):
+    """Retrieve a specific model in OpenAI API format dynamically."""
+    await ensure_authenticated()
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            qwen_url = f"{get_base_url()}/models/{model_id}"
+            headers = {
+                "Authorization": f"Bearer {credentials['access_token']}"
+            }
+            response = await client.get(qwen_url, headers=headers)
+            if response.status_code == 200:
+                return response.json()
+    except Exception as e:
+        pass
+        
+    return {
+        "id": model_id,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "qwen",
+        "permission": [],
+        "root": model_id,
+        "parent": None,
+    }
+
 @app.on_event("startup")
 async def startup_event():
     print("=" * 50)
@@ -303,6 +379,265 @@ async def show_model(request: Request):
     }
 
 
+@app.post("/api/me")
+@app.get("/api/me")
+async def api_me():
+    return {"status": "ok", "authenticated": True}
+
+@app.post("/api/generate")
+async def ollama_generate(request: Request):
+    await ensure_authenticated()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise RuntimeError(f"Invalid JSON request body: {e}")
+
+    model = body.get("model", "qwen3-coder-plus")
+    prompt = body.get("prompt", "")
+    stream = body.get("stream", False)
+
+    openai_body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": stream
+    }
+
+    if "options" in body and body["options"] is not None:
+        options = body["options"]
+        if "temperature" in options:
+            openai_body["temperature"] = options["temperature"]
+        if "top_p" in options:
+            openai_body["top_p"] = options["top_p"]
+        if "num_predict" in options:
+            openai_body["max_tokens"] = options["num_predict"]
+
+    async def generate_ollama_stream() -> AsyncGenerator[str, None]:
+        max_retries = 2
+        retry_count = 0
+
+        while retry_count <= max_retries:
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    qwen_url = f"{get_base_url()}/chat/completions"
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {credentials['access_token']}",
+                        "Accept": "text/event-stream"
+                    }
+
+                    openai_body["stream"] = True
+
+                    async with client.stream("POST", qwen_url, headers=headers, json=openai_body, timeout=None) as response:
+                        response.raise_for_status()
+                        
+                        async for line in response.aiter_lines():
+                            if line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    continue
+                                try:
+                                    data = json.loads(data_str)
+                                    ollama_chunk = {
+                                        "model": data.get("model", model),
+                                        "created_at": datetime.now(timezone.utc).isoformat(),
+                                        "response": "",
+                                        "done": False
+                                    }
+                                    
+                                    if "choices" in data and len(data["choices"]) > 0:
+                                        delta = data["choices"][0].get("delta", {})
+                                        if "content" in delta:
+                                            ollama_chunk["response"] = delta.get("content", "")
+                                        
+                                        if data["choices"][0].get("finish_reason"):
+                                            ollama_chunk["done"] = True
+                                            ollama_chunk["done_reason"] = data["choices"][0]["finish_reason"]
+                                            
+                                    yield json.dumps(ollama_chunk) + "\n"
+                                except json.JSONDecodeError:
+                                    continue
+                        break # Success
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 401 and retry_count < max_retries:
+                    try:
+                        await refresh_access_token()
+                        retry_count += 1
+                        continue
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Ollama generate proxy error: HTTP {e.response.status_code}")
+            except Exception as e:
+                if retry_count < max_retries:
+                    retry_count += 1
+                    continue
+                raise RuntimeError(f"Unexpected error: {e}")
+
+    if stream:
+        return StreamingResponse(generate_ollama_stream(), media_type="application/x-ndjson")
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                qwen_url = f"{get_base_url()}/chat/completions"
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {credentials['access_token']}"
+                }
+                response = await client.post(qwen_url, headers=headers, json=openai_body)
+                response.raise_for_status()
+                data = response.json()
+                
+                content = ""
+                if "choices" in data and len(data["choices"]) > 0:
+                    msg = data["choices"][0].get("message", {})
+                    content = msg.get("content", "")
+                
+                ollama_resp = {
+                    "model": data.get("model", model),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "response": content,
+                    "done": True,
+                    "done_reason": data.get("choices", [{}])[0].get("finish_reason", "stop")
+                }
+                return ollama_resp
+        except Exception as e:
+            raise RuntimeError(f"Ollama generate request failed: {e}")
+
+@app.post("/api/chat")
+async def ollama_chat(request: Request):
+    await ensure_authenticated()
+    try:
+        body = await request.json()
+    except Exception as e:
+        raise RuntimeError(f"Invalid JSON request body: {e}")
+
+    model = body.get("model", "qwen3-coder-plus")
+    messages = body.get("messages", [])
+    stream = body.get("stream", False)
+
+    openai_body = {
+        "model": model,
+        "messages": messages,
+        "stream": stream
+    }
+
+    if "options" in body and body["options"] is not None:
+        options = body["options"]
+        if "temperature" in options:
+            openai_body["temperature"] = options["temperature"]
+        if "top_p" in options:
+            openai_body["top_p"] = options["top_p"]
+        if "num_predict" in options:
+            openai_body["max_tokens"] = options["num_predict"]
+            
+    if "tools" in body:
+        openai_body["tools"] = body["tools"]
+
+    async def generate_ollama_stream() -> AsyncGenerator[str, None]:
+        max_retries = 2
+        retry_count = 0
+
+        while retry_count <= max_retries:
+            try:
+                async with httpx.AsyncClient(timeout=300.0) as client:
+                    qwen_url = f"{get_base_url()}/chat/completions"
+                    headers = {
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {credentials['access_token']}",
+                        "Accept": "text/event-stream"
+                    }
+
+                    openai_body["stream"] = True
+
+                    async with client.stream("POST", qwen_url, headers=headers, json=openai_body, timeout=None) as response:
+                        response.raise_for_status()
+                        
+                        async for line in response.aiter_lines():
+                            if line.startswith("data: "):
+                                data_str = line[6:]
+                                if data_str == "[DONE]":
+                                    continue
+                                try:
+                                    data = json.loads(data_str)
+                                    ollama_chunk = {
+                                        "model": data.get("model", model),
+                                        "created_at": datetime.now(timezone.utc).isoformat(),
+                                        "message": {"role": "assistant", "content": ""},
+                                        "done": False
+                                    }
+                                    
+                                    if "choices" in data and len(data["choices"]) > 0:
+                                        delta = data["choices"][0].get("delta", {})
+                                        if "role" in delta:
+                                            ollama_chunk["message"]["role"] = delta["role"]
+                                        if "content" in delta:
+                                            ollama_chunk["message"]["content"] = delta.get("content", "")
+                                        if "tool_calls" in delta:
+                                            ollama_chunk["message"]["tool_calls"] = delta["tool_calls"]
+                                        
+                                        if data["choices"][0].get("finish_reason"):
+                                            ollama_chunk["done"] = True
+                                            ollama_chunk["done_reason"] = data["choices"][0]["finish_reason"]
+                                            
+                                    yield json.dumps(ollama_chunk) + "\n"
+                                except json.JSONDecodeError:
+                                    continue
+                        break # Success
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 401 and retry_count < max_retries:
+                    try:
+                        await refresh_access_token()
+                        retry_count += 1
+                        continue
+                    except Exception:
+                        pass
+                raise RuntimeError(f"Ollama chat proxy error: HTTP {e.response.status_code}")
+            except Exception as e:
+                if retry_count < max_retries:
+                    retry_count += 1
+                    continue
+                raise RuntimeError(f"Unexpected error: {e}")
+
+    if stream:
+        return StreamingResponse(generate_ollama_stream(), media_type="application/x-ndjson")
+    else:
+        try:
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                qwen_url = f"{get_base_url()}/chat/completions"
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {credentials['access_token']}"
+                }
+                response = await client.post(qwen_url, headers=headers, json=openai_body)
+                response.raise_for_status()
+                data = response.json()
+                
+                content = ""
+                role = "assistant"
+                tool_calls = []
+                if "choices" in data and len(data["choices"]) > 0:
+                    msg = data["choices"][0].get("message", {})
+                    content = msg.get("content", "")
+                    role = msg.get("role", "assistant")
+                    if "tool_calls" in msg:
+                        tool_calls = msg["tool_calls"]
+                
+                ollama_resp = {
+                    "model": data.get("model", model),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "message": {
+                        "role": role,
+                        "content": content
+                    },
+                    "done": True,
+                    "done_reason": data.get("choices", [{}])[0].get("finish_reason", "stop")
+                }
+                if tool_calls:
+                    ollama_resp["message"]["tool_calls"] = tool_calls
+                    
+                return ollama_resp
+        except Exception as e:
+            raise RuntimeError(f"Ollama chat request failed: {e}")
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     await ensure_authenticated()
@@ -322,6 +657,17 @@ async def chat_completions(request: Request):
         raise RuntimeError("Model name is required")
     if not messages or not isinstance(messages, list):
         raise RuntimeError("Messages field is required and must be an array")
+
+    # Verify that the model is supported
+    supported_models = ["qwen3-coder-plus", "vision-model"]
+    if model not in supported_models:
+        raise RuntimeError(f"Unsupported model: {model}. Supported models: {', '.join(supported_models)}")
+
+    # Sanitize body for DashScope compatibility
+    # DashScope is strict and will reject unknown OpenAI parameters used by some clients
+    qwen_body = dict(body)
+    for key in ["stream_options", "user", "metadata"]:
+        qwen_body.pop(key, None)
 
     # Verify that the model is supported
     supported_models = ["qwen3-coder-plus", "vision-model"]
@@ -438,4 +784,4 @@ async def chat_completions(request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("proxy_server:app", host="localhost", port=11434, reload=True)
+    uvicorn.run("proxy_server:app", host="localhost", port=11434, reload=True, use_colors=False)
